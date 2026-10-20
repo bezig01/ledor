@@ -8,6 +8,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 Release notes on GitHub are taken verbatim from the section matching the tag,
 so each version heading below must stay in the `## [x.y.z]` shape.
 
+## [0.3.1]
+
+### Added
+
+- Import several EPUBs at once, from the file picker or by dropping them onto
+  the window on Linux. The import button counts progress and a summary says
+  how many made it; a broken file no longer stops the rest. Thanks
+  @guty3rrez (#42).
+- Offline indicator. A cloud icon in the library shows when sync can't reach
+  Drive; tapping it retries right away.
+
+### Fixed
+
+- The screen dimmed and locked while RSVP was playing on Android, since there
+  is no touch input during playback. It now stays on while RSVP plays and goes
+  back to the normal timeout on pause. Closes #43.
+- The focus line and ORP marks jumped up and down whenever a long word shrank
+  the font to fit. They now stay put; only the word itself shrinks.
+  Closes #44.
+- Reading offline popped a "Sync failed" message every time you paused. Losing
+  the connection is no longer an error: sync retries every minute and pushes
+  whatever is pending once you're back online. Settings changed offline are
+  kept until they reach Drive, even across restarts. Closes #45.
+- On Linux, the theme mode (System / Light / Dark) didn't survive a restart.
+  Thanks @guty3rrez (#41).
+- On Linux without zenity or kdialog, importing showed a generic error; it now
+  says what to install. Thanks @guty3rrez (#42).
+
 ## [0.3.0]
 
 ### Added
