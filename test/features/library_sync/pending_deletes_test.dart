@@ -23,7 +23,9 @@ import '../../fixtures/fake_path_provider.dart';
 import '../../fixtures/fake_sync_folder_gateway.dart';
 
 const _kBooksShard = 'library/books.json';
+const _kSettingsShard = 'library/settings.json';
 const _kPendingDeletesKey = 'sync_pendingDeletes';
+const _kSettingsDirtyAtKey = 'sync_settingsDirtyAt';
 
 /// Signed-in (or signed-out, with null email) auth backend stub.
 class _FakeAuthBackend extends DriveAuthBackend {
@@ -256,14 +258,14 @@ void main() {
     // were created against. Without the clear, a delete that failed to
     // push would be replayed against the NEXT connected account, writing
     // a phantom tombstone into that folder's shard.
-    test('clearPendingDeletes drops the queue so a later sync pushes '
+    test('resetForDisconnect drops the queue so a later sync pushes '
         'nothing', () async {
       gateway.readable = false;
       final notifier = container.read(librarySyncProvider.notifier);
       await notifier.pushDelete('book-1');
       expect(await readPendingPref(), contains('book-1'));
 
-      await notifier.clearPendingDeletes();
+      await notifier.resetForDisconnect();
       expect(await readPendingPref(), isNull);
 
       gateway.readable = true;
@@ -272,6 +274,85 @@ void main() {
       final shard = gateway.textFiles[_kBooksShard];
       expect(shard == null || !shard.contains('book-1'), isTrue,
           reason: 'no phantom tombstone for the cleared delete');
+    });
+  });
+
+  group('offline', () {
+    test('a network failure goes offline quietly and the next sync '
+        'recovers', () async {
+      gateway.readError = const SocketException('Failed host lookup');
+      final notifier = container.read(librarySyncProvider.notifier);
+      await notifier.triggerSync();
+
+      final offline = container.read(librarySyncProvider);
+      expect(offline.stage, SyncStage.offline);
+      expect(offline.errorMessage, isNull,
+          reason: 'offline must not surface as an error snackbar');
+
+      gateway.readError = null;
+      await notifier.triggerSync();
+      expect(container.read(librarySyncProvider).stage, SyncStage.done);
+    });
+
+    test('while offline only the background retry skips `syncing`',
+        () async {
+      gateway.readError = const SocketException('Failed host lookup');
+      final notifier = container.read(librarySyncProvider.notifier);
+      await notifier.triggerSync();
+      final stages = <SyncStage>[];
+      container.listen(
+        librarySyncProvider,
+        (_, next) => stages.add(next.stage),
+      );
+
+      await notifier.triggerSync(quiet: true);
+      expect(stages, isNot(contains(SyncStage.syncing)));
+
+      // A user-initiated attempt shows progress, so a tap right after the
+      // connection returns doesn't look like it did nothing.
+      gateway.readError = null;
+      await notifier.triggerSync();
+      expect(stages, containsAllInOrder([SyncStage.syncing, SyncStage.done]));
+    });
+
+    test('disconnecting while offline clears the offline status', () async {
+      gateway.readError = const SocketException('Failed host lookup');
+      final notifier = container.read(librarySyncProvider.notifier);
+      await notifier.triggerSync();
+      expect(container.read(librarySyncProvider).stage, SyncStage.offline);
+
+      await notifier.resetForDisconnect();
+      expect(container.read(librarySyncProvider).stage, SyncStage.idle);
+    });
+
+    test('a settings change made offline still wins after a restart',
+        () async {
+      gateway.readError = const SocketException('Failed host lookup');
+      final coldNotifier = container.read(librarySyncProvider.notifier);
+      coldNotifier.markSettingsDirty();
+      await coldNotifier.triggerSync();
+      final stamp = await SharedPreferencesAsync().getString(
+        _kSettingsDirtyAtKey,
+      );
+      expect(stamp, isNotNull);
+
+      // "Restart": the in-memory stamp is gone, only the persisted one is
+      // left to make the local settings win the LWW.
+      gateway.readError = null;
+      final warmContainer = await buildContainer(signedIn: true);
+      addTearDown(warmContainer.dispose);
+      await warmContainer.read(librarySyncProvider.notifier).triggerSync();
+
+      final pushed =
+          SyncSettingsShard.decode(gateway.textFiles[_kSettingsShard]!);
+      expect(
+        pushed.settings!.updatedAt.isAtSameMomentAs(DateTime.parse(stamp!)),
+        isTrue,
+      );
+      expect(
+        await SharedPreferencesAsync().getString(_kSettingsDirtyAtKey),
+        isNull,
+      );
     });
   });
 }

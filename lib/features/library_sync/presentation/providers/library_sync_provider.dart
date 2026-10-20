@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show SocketException, TlsException;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../../core/di/providers.dart';
@@ -50,11 +52,26 @@ final syncImportFailuresProvider =
   return ref.watch(syncImportFailuresDaoProvider).watchAll();
 });
 
-enum SyncStage { idle, syncing, error, done }
+/// [offline]: the last attempt couldn't reach Drive. Not an error — local
+/// changes stay pending and a retry runs every [_offlineRetryInterval].
+enum SyncStage { idle, syncing, error, offline, done }
 
 /// SharedPreferences key holding the queued delete tombstones (JSON list).
 /// Kept under the same `sync_` prefix as the SyncConfig keys.
 const _kPendingDeletes = 'sync_pendingDeletes';
+
+/// When local settings last changed without reaching Drive yet. Persisted
+/// so an offline settings change still wins the LWW after a restart.
+const _kSettingsDirtyAt = 'sync_settingsDirtyAt';
+
+const _offlineRetryInterval = Duration(minutes: 1);
+
+/// IOClient rethrows socket failures as ClientException (which also
+/// implements SocketException), so this covers DNS / no-route / reset.
+/// TlsException covers captive portals (hotel Wi-Fi), which IOClient
+/// doesn't wrap.
+bool _isNetworkError(Object e) =>
+    e is SocketException || e is TlsException || e is http.ClientException;
 
 /// A book deletion waiting to be propagated to the sync folder as a
 /// tombstone. Books are hard-deleted locally, so this queue is the only
@@ -130,6 +147,7 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
   final Ref _ref;
   final SharedPreferencesAsync _prefs;
   Timer? _debounce;
+  Timer? _offlineRetry;
   bool _running = false;
   bool _queued = false;
   DateTime? _settingsUpdatedAt;
@@ -198,11 +216,14 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
     } catch (_) {/* best effort — queue stays in memory */}
   }
 
-  /// Drop the queued delete tombstones, memory and disk. Called on
-  /// disconnect: queued deletes belong to the account/folder they were
-  /// created against, and replaying them after connecting a different
-  /// account would write phantom tombstones into the new folder's shard.
-  Future<void> clearPendingDeletes() async {
+  /// Forget the disconnected account's sync state. Queued deletes belong
+  /// to the account/folder they were created against — replaying them
+  /// after connecting a different account would write phantom tombstones
+  /// into the new folder's shard — and an offline/error status would keep
+  /// promising a sync that will never run.
+  Future<void> resetForDisconnect() async {
+    _offlineRetry?.cancel();
+    state = const LibrarySyncState();
     _pendingDeletes.clear();
     // Mark the disk state as known-empty so neither a pending load nor a
     // future one resurrects the cleared entries.
@@ -216,7 +237,20 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
   /// Record that the local settings just changed. Used to stamp the settings
   /// snapshot during the next push.
   void markSettingsDirty() {
-    _settingsUpdatedAt = DateTime.now().toUtc();
+    final at = DateTime.now().toUtc();
+    _settingsUpdatedAt = at;
+    unawaited(_prefs
+        .setString(_kSettingsDirtyAt, at.toIso8601String())
+        .catchError((_) {/* best effort — memory still has it */}));
+  }
+
+  Future<DateTime?> _loadSettingsDirtyAt() async {
+    try {
+      final raw = await _prefs.getString(_kSettingsDirtyAt);
+      return raw == null ? null : DateTime.tryParse(raw)?.toUtc();
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Schedule a sync ~2s from now, coalescing multiple rapid calls.
@@ -232,7 +266,10 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
 
   /// Run a sync now. Safe to call multiple times: concurrent calls are
   /// coalesced into one queued re-run after the current one finishes.
-  Future<void> triggerSync() async {
+  /// [quiet] is for the offline retry: it doesn't flip an `offline` stage
+  /// to `syncing`, which would flash the library's sync hairline every
+  /// minute. Anything the user triggered should show the attempt.
+  Future<void> triggerSync({bool quiet = false}) async {
     final config = _ref.read(syncConfigProvider);
     if (!config.isConfigured) return;
     if (!_ref.read(driveAuthProvider).isSignedIn) return;
@@ -243,10 +280,15 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
     }
     _running = true;
     _debounce?.cancel();
-    state = state.copyWith(stage: SyncStage.syncing, clearError: true);
+    _offlineRetry?.cancel();
+    if (!quiet || state.stage != SyncStage.offline) {
+      state = state.copyWith(stage: SyncStage.syncing, clearError: true);
+    }
 
     final service = _ref.read(librarySyncServiceProvider);
     try {
+      _settingsUpdatedAt ??= await _loadSettingsDirtyAt();
+      final settingsDirtyAt = _settingsUpdatedAt;
       await _flushPendingDeletes(service, config);
       final completedAt = await service.sync(
         config: config,
@@ -256,7 +298,7 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
               .read(displaySettingsProvider.notifier)
               .applyFromRemote(synced);
         },
-        localSettingsUpdatedAt: _settingsUpdatedAt,
+        localSettingsUpdatedAt: settingsDirtyAt,
         onImportProgress: (current, total, fileName) {
           state = state.copyWith(
             importCurrent: current,
@@ -265,18 +307,35 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
           );
         },
       );
-      _settingsUpdatedAt = null;
+      // A settings change that landed mid-sync wasn't in this push; keep
+      // its stamp for the queued re-run.
+      if (identical(_settingsUpdatedAt, settingsDirtyAt)) {
+        _settingsUpdatedAt = null;
+        try {
+          await _prefs.remove(_kSettingsDirtyAt);
+        } catch (_) {/* best effort — a stale stamp only re-pushes */}
+      }
       await _ref.read(syncConfigProvider.notifier).markSyncedAt(completedAt);
       state = LibrarySyncState(
         stage: SyncStage.done,
         lastSyncedAt: completedAt,
       );
     } catch (e) {
-      state = state.copyWith(
-        stage: SyncStage.error,
-        errorMessage: e.toString(),
-        clearImport: true,
-      );
+      if (_isNetworkError(e)) {
+        state = state.copyWith(
+          stage: SyncStage.offline,
+          clearError: true,
+          clearImport: true,
+        );
+        _offlineRetry =
+            Timer(_offlineRetryInterval, () => triggerSync(quiet: true));
+      } else {
+        state = state.copyWith(
+          stage: SyncStage.error,
+          errorMessage: e.toString(),
+          clearImport: true,
+        );
+      }
     } finally {
       _running = false;
       if (_queued) {
@@ -359,6 +418,7 @@ class LibrarySyncNotifier extends StateNotifier<LibrarySyncState> {
   @override
   void dispose() {
     _debounce?.cancel();
+    _offlineRetry?.cancel();
     super.dispose();
   }
 }

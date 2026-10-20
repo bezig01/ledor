@@ -212,9 +212,7 @@ class _DriveAccountRow extends ConsumerWidget {
     await ref.read(driveAuthProvider.notifier).signOut();
     await ref.read(syncConfigProvider.notifier).setDriveFolderId(null);
     ref.read(driveSyncFolderGatewayProvider).clearCache();
-    // Queued delete tombstones belong to the disconnected account; never
-    // replay them against whichever account connects next.
-    await ref.read(librarySyncProvider.notifier).clearPendingDeletes();
+    await ref.read(librarySyncProvider.notifier).resetForDisconnect();
   }
 }
 
@@ -346,6 +344,13 @@ class _SyncStatusRow extends StatelessWidget {
           l10n.syncFailed(state.errorMessage!),
           style: const TextStyle(color: Colors.redAccent, fontSize: 12),
         ),
+      );
+    }
+
+    if (state.stage == SyncStage.offline) {
+      return Text(
+        l10n.syncOffline,
+        style: TextStyle(color: mutedColor, fontSize: 12),
       );
     }
 
